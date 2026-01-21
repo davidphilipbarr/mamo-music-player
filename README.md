@@ -4,6 +4,9 @@ Mamo is bases on [Namo](https://github.com/hardcoeur/Namo)
 
 Mamo is a simple GTK4/Adwaita based media player written in Python, focusing on local music playback and basic library management.
 
+
+![image](mamo1.png)
+
 ## Features
 
 *   Playback of local audio files supported by GStreamer.
