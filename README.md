@@ -1,4 +1,4 @@
-Mamo is bases on Namo, which I currently cannot locate to credit better. 
+Mamo is bases on [Namo](https://github.com/hardcoeur/Namo) 
 
 # Mamo Media Player
 
