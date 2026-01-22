@@ -1,9 +1,16 @@
-Mamo is bases on [Namo](https://github.com/hardcoeur/Namo) 
+Mamo is based on [Namo](https://github.com/hardcoeur/Namo)
 
 # Mamo Media Player
 
-Mamo is a simple GTK4/Adwaita based media player written in Python, focusing on local music playback and basic library management.
+Mamo is a simple GTK4/Adwaita based media player written in Python, focusing on local music playback.
 
+## Changes from Namo
+
+* Remove bandcamp integration
+* Add MPRIS support
+* Add wildly inacurate waveform
+* Various ui tweaks
+* Generally more Muine like
 
 ![image](mamo1.png)
 
@@ -13,7 +20,8 @@ Mamo is a simple GTK4/Adwaita based media player written in Python, focusing on 
 *   Metadata display (Artist, Album, Title, Track Number).
 *   Album artwork display.
 *   Playlist management (adding, removing, saving, loading).
-*   Standard media player controls (Play/Pause, Next/Previous, Seek, Volume).
+*   Standard media player controls (Play/Pause, Next/Previous, Seek).
+*   MPRIS support
 *   Modern user interface using GTK4 and Libadwaita.
 
 ## Dependencies
@@ -32,12 +40,6 @@ Mamo is a simple GTK4/Adwaita based media player written in Python, focusing on 
 ## Installation
 
 Install the necessary dependencies for your Linux distribution:
-
-### Fedora
-
-```bash
-sudo dnf install python3 python3-gobject gtk4 libadwaita python3-mutagen gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free gstreamer1-plugins-ugly-free gstreamer1-libav
-```
 
 ### Debian / Ubuntu
 
