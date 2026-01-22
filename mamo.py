@@ -517,13 +517,14 @@ class MamoWindow(Adw.ApplicationWindow):
         self.cover_image = Gtk.Image.new_from_icon_name("audio-x-generic-symbolic") 
         self.cover_image.set_pixel_size(100)
         self.cover_image.add_css_class("album-art-image") 
+        self.cover_image.set_visible(True)
         song_info_box.append(self.cover_image)
 
         song_details_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         song_details_box.set_valign(Gtk.Align.CENTER)
         song_info_box.append(song_details_box)
 
-        self.song_label = Gtk.Label(label="<Song Title>", xalign=0)
+        self.song_label = Gtk.Label(label="", xalign=0)
         self.song_label.set_ellipsize(Pango.EllipsizeMode.END) 
         self.song_label.add_css_class("title-5") 
         song_details_box.append(self.song_label)
@@ -610,6 +611,9 @@ class MamoWindow(Adw.ApplicationWindow):
             self._load_playlist()
         else:
             print("Clear Playlist on Start is enabled. Starting empty.")
+
+        self._update_viewport()
+        self._update_song_display(None)
         # Removed initial remaining time update call
 
     def _update_viewport(self, model=None, position=None, removed=None, added=None):
@@ -650,8 +654,8 @@ class MamoWindow(Adw.ApplicationWindow):
         dark_mode_action.connect("activate", self._on_dark_mode_action_activated)
         action_group.add_action(dark_mode_action)
 
-        # Stateful auto play action
-        auto_play_action = Gio.SimpleAction.new_stateful("auto_play", None, GLib.Variant.new_boolean(False))
+        # Stateful auto play action - default to True
+        auto_play_action = Gio.SimpleAction.new_stateful("auto_play", None, GLib.Variant.new_boolean(True))
         auto_play_action.connect("activate", self._on_auto_play_action_activated)
         action_group.add_action(auto_play_action)
 
@@ -1446,8 +1450,9 @@ class MamoWindow(Adw.ApplicationWindow):
             GLib.idle_add(self.playlist_store.append, song_to_add)
             print(f"Scheduled add for: {final_title or 'Unknown Title'}")
 
-            # Auto-play if requested
-            if self._auto_play_after_load:
+            # Auto-play if requested via internal flag OR menu setting
+            auto_play_enabled = self.action_group.get_action_state("auto_play").get_boolean()
+            if self._auto_play_after_load or auto_play_enabled:
                 GLib.idle_add(self._check_and_autoplay, song_to_add)
 
         elif result == GstPbutils.DiscovererResult.TIMEOUT:
@@ -1464,9 +1469,10 @@ class MamoWindow(Adw.ApplicationWindow):
         # Only autoplay if requested AND nothing is currently playing (to avoid interruption)
         # unless it's an explicit "Play Album" which we might want to allow to interrupt.
         # For now, let's keep it safe: only if not already playing.
-        if self._auto_play_after_load:
+        auto_play_enabled = self.action_group.get_action_state("auto_play").get_boolean()
+        if self._auto_play_after_load or auto_play_enabled:
             if self.player and self.player.get_state(0).state == Gst.State.PLAYING:
-                self._auto_play_after_load = False # Clear flag, we are already busy
+                self._auto_play_after_load = False # Clear internal flag
                 return
 
             target_song = None
@@ -1511,10 +1517,8 @@ class MamoWindow(Adw.ApplicationWindow):
                 self.play_pause_button.set_icon_name(self.PLAY_ICON)
                 self.waveform.set_fraction(0.0)
                 self.waveform.set_sensitive(False)
-                self.time_label_current.set_label("0:00")
-                self.time_label_remaining.set_label("-0:00")
-                self.song_label.set_label("<No Song Playing>")
                 self.current_song = None
+                self._update_song_display(None)
         elif t == Gst.MessageType.EOS:
             print("End-of-stream reached.")
 
@@ -1532,13 +1536,16 @@ class MamoWindow(Adw.ApplicationWindow):
                 self.play_pause_button.set_icon_name(self.PLAY_ICON)
                 self.waveform.set_fraction(0.0)
                 self.waveform.set_sensitive(False)
-                self.time_label_current.set_label("0:00")
-                self.time_label_remaining.set_label("-0:00")
-                self.song_label.set_label("<No Song Playing>")
                 self.current_song = None
+                self._update_song_display(None)
                 
-                print("EOS: Selecting next song.")
-                self._on_next_clicked() 
+                # Auto-play next if enabled
+                auto_play_enabled = self.action_group.get_action_state("auto_play").get_boolean()
+                if auto_play_enabled:
+                    print("EOS: Autoplay enabled. Selecting next song.")
+                    GLib.idle_add(self._on_next_clicked) 
+                else:
+                    print("EOS: Autoplay disabled. Stopping.")
         elif t == Gst.MessageType.ELEMENT:
             if self._level_elem and message.src == self._level_elem:
                 if not self.current_song:
@@ -1605,6 +1612,10 @@ class MamoWindow(Adw.ApplicationWindow):
         return True
     def _update_song_display(self, song):
         """Updates the song title, artist, time label (0:00 / Duration), and cover art."""
+        # Always reset to placeholder first to prevent persistence of old artwork
+        self.cover_image.set_from_icon_name("audio-x-generic-symbolic")
+        self.cover_image.set_visible(True)
+
         # Update is_playing state in playlist - O(N) but better than old loop if we only touch changed items
         # Fast path: only reset previous and set new
         if not hasattr(self, "_last_indicated_song"):
@@ -1655,14 +1666,13 @@ class MamoWindow(Adw.ApplicationWindow):
                     
                 except Exception as e:
                     print(f"Error loading album art in _update_song_display for '{song.title}': {e}", file=sys.stderr)
-                    self.cover_image.set_from_icon_name("audio-x-generic-symbolic") 
-            else:
-                self.cover_image.set_from_icon_name("audio-x-generic-symbolic") 
+                    # Already set to generic icon above
             
             if song.waveform_data:
                 self.waveform.set_waveform_data(song.waveform_data)
             else:
                 self.waveform.set_waveform_data([])
+            
         else:
             
             
@@ -1755,7 +1765,11 @@ class MamoWindow(Adw.ApplicationWindow):
             print("Previous: Selecting previous track.")
             current_pos = self.selection_model.get_selected()
             if current_pos != Gtk.INVALID_LIST_POSITION and current_pos > 0:
-                self.selection_model.set_selected(current_pos - 1)
+                new_pos = current_pos - 1
+                self.selection_model.set_selected(new_pos)
+                song = self.playlist_store.get_item(new_pos)
+                if song and song.uri:
+                    self.play_uri(song.uri)
             
 
     def _on_next_clicked(self, button=None): 
@@ -1767,10 +1781,17 @@ class MamoWindow(Adw.ApplicationWindow):
         current_pos = self.selection_model.get_selected()
 
         if current_pos != Gtk.INVALID_LIST_POSITION and current_pos < (n_items - 1):
-            self.selection_model.set_selected(current_pos + 1)
+            new_pos = current_pos + 1
+            self.selection_model.set_selected(new_pos)
+            song = self.playlist_store.get_item(new_pos)
+            if song and song.uri:
+                self.play_uri(song.uri)
         elif current_pos == Gtk.INVALID_LIST_POSITION and n_items > 0:
              
              self.selection_model.set_selected(0)
+             song = self.playlist_store.get_item(0)
+             if song and song.uri:
+                 self.play_uri(song.uri)
         
 
     
@@ -1939,7 +1960,7 @@ class MamoWindow(Adw.ApplicationWindow):
                     # Apply style
                     self._apply_dark_mode(dark_mode)
 
-                    auto_play = settings.get("auto_play", False)
+                    auto_play = settings.get("auto_play", True)
                     ap_action = self.action_group.lookup_action("auto_play")
                     if ap_action:
                         ap_action.change_state(GLib.Variant.new_boolean(auto_play))
