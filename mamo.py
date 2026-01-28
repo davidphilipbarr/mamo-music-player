@@ -11,6 +11,7 @@ gi.require_version('GdkPixbuf', '2.0')
 gi.require_version('Graphene', '1.0')
 
 import threading
+import collections
 import os 
 import random
 import tempfile
@@ -21,7 +22,53 @@ import base64
 import mutagen
 import pathlib 
 from urllib.parse import urlparse, unquote
+import hashlib
 from gi.repository import Gtk, Adw, Gio, GLib, GObject, Gst, GstPbutils, GdkPixbuf, Gdk, Pango, Graphene
+
+STYLE_CSS = """
+.title-4 {
+    font-weight: bold;
+    font-size: 10pt;
+}
+
+.title-5 {
+    font-weight: bold;
+    font-size: 12pt;
+}
+
+.caption {
+    opacity: 0.8;
+    font-size: small;
+}
+
+.title-3 {
+    font-weight: bold;
+    font-size: large;
+    margin-bottom: 6px;
+}
+
+.album-art-image {
+/*
+    box-shadow: 2px 2px 4px rgba(0, 0, 0, 0.205);
+*/
+}
+
+
+.playlist-song-title {
+    font-weight: bold;
+    font-size: 11pt;
+}
+
+.playlist-song-subtitle {
+    opacity: 0.7;
+    font-size: 9pt;
+}
+
+/* Zebra striping for playlist */
+.playlist-view row:nth-child(odd) {
+    background-color: alpha(currentColor, 0.06);
+}
+"""
 
 
 
@@ -48,6 +95,422 @@ class Song(GObject.Object):
         
         self.duration = duration if isinstance(duration, int) and duration >= 0 else 0
         self.waveform_data = None # List of linear amplitude values (0.0 - 1.0)
+
+
+class Album(GObject.Object):
+    __gtype_name__ = 'Album'
+
+    title = GObject.Property(type=str, default="Unknown Album")
+    artist = GObject.Property(type=str, default="Unknown Artist")
+    art_data = GObject.Property(type=GLib.Bytes)
+    folder = GObject.Property(type=str) # The folder containing the album
+
+    def __init__(self, title, artist, folder, art_data=None):
+        super().__init__()
+        self.title = title
+        self.artist = artist
+        self.folder = folder
+        self.art_data = art_data
+
+
+class LibraryManager(GObject.Object):
+    """
+    Manages the persistent library database (at ~/.cache/mamo/library.json).
+    Scans the library path in a background thread.
+    """
+    __gsignals__ = {
+        'library-updated': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'scan-started': (GObject.SignalFlags.RUN_FIRST, None, ()),
+        'scan-finished': (GObject.SignalFlags.RUN_FIRST, None, ()),
+    }
+
+    def __init__(self, library_path, cache_file):
+        super().__init__()
+        self.library_path = library_path
+        self.cache_file = cache_file
+        self.albums = [] # List of Album objects
+        self._is_scanning = False
+        self._is_loading_cache = False
+        threading.Thread(target=self._load_cache_thread, daemon=True).start()
+
+    def _load_cache_thread(self):
+        """Background thread to load the library cache."""
+        if not os.path.exists(self.cache_file):
+            return
+        
+        self._is_loading_cache = True
+        temp_albums = []
+        try:
+            print(f"LibraryManager: Loading cache from {self.cache_file}")
+            with open(self.cache_file, 'r') as f:
+                data = json.load(f)
+                for item in data:
+                    art_data = None
+                    if 'art_base64' in item and item['art_base64']:
+                        try:
+                            raw = base64.b64decode(item['art_base64'])
+                            art_data = GLib.Bytes.new(raw)
+                        except:
+                            pass
+                    
+                    album = Album(
+                        title=item.get('title', 'Unknown Album'),
+                        artist=item.get('artist', 'Unknown Artist'),
+                        folder=item.get('folder', ''),
+                        art_data=art_data
+                    )
+                    temp_albums.append(album)
+            
+            def finalize_load():
+                self.albums = temp_albums
+                self._is_loading_cache = False
+                self.emit('library-updated')
+                return False
+
+            GLib.idle_add(finalize_load)
+        except Exception as e:
+            print(f"LibraryManager: Error loading cache: {e}")
+            self._is_loading_cache = False
+
+    def _save_cache(self):
+        os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+        try:
+            data = []
+            for album in self.albums:
+                art_base64 = None
+                if album.art_data:
+                    art_base64 = base64.b64encode(album.art_data.get_data()).decode('utf-8')
+                
+                data.append({
+                    'title': album.title,
+                    'artist': album.artist,
+                    'folder': album.folder,
+                    'art_base64': art_base64
+                })
+            with open(self.cache_file, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"LibraryManager: Error saving cache: {e}")
+
+    def start_scan(self):
+        if self._is_scanning:
+            return
+        if not self.library_path or not os.path.exists(self.library_path):
+            return
+
+        self._is_scanning = True
+        self.emit('scan-started')
+        thread = threading.Thread(target=self._scan_worker, daemon=True)
+        thread.start()
+
+    def _scan_worker(self):
+        print(f"LibraryManager: Starting scan of {self.library_path}")
+        found_albums = {} # (artist, title) -> Album
+
+        for root, dirs, files in os.walk(self.library_path):
+            audio_files = [f for f in files if f.lower().endswith(('.mp3', '.flac', '.m4a', '.ogg'))]
+            if audio_files:
+                first_file = os.path.join(root, audio_files[0])
+                try:
+                    audio = mutagen.File(first_file, easy=True)
+                    if not audio: continue
+                    album_title = audio.get('album', ['Unknown Album'])[0]
+                    artist = audio.get('artist', ['Unknown Artist'])[0]
+                    
+                    key = (artist, album_title)
+                    if key not in found_albums:
+                        art_data = self._find_art_for_folder(root)
+                        if not art_data:
+                            art_data = self._find_embedded_art(first_file)
+                        album = Album(title=album_title, artist=artist, folder=root, art_data=art_data)
+                        found_albums[key] = album
+                        
+                        # Periodically update UI (every 10 albums)
+                        if len(found_albums) % 10 == 0:
+                            GLib.idle_add(self._on_partial_update, list(found_albums.values()))
+                except Exception as e:
+                    print(f"LibraryManager: Error scanning {first_file}: {e}")
+
+        final_albums = list(found_albums.values())
+        self._save_cache_data(final_albums)
+        GLib.idle_add(self._on_scan_complete, final_albums)
+
+    def _on_scan_complete(self, albums):
+        self.albums = albums
+        self._is_scanning = False
+        self.emit('library-updated')
+        self.emit('scan-finished')
+
+    def _save_cache_data(self, albums):
+        os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+        try:
+            data = []
+            for album in albums:
+                art_base64 = None
+                if album.art_data:
+                    art_base64 = base64.b64encode(album.art_data.get_data()).decode('utf-8')
+                
+                data.append({
+                    'title': album.title,
+                    'artist': album.artist,
+                    'folder': album.folder,
+                    'art_base64': art_base64
+                })
+            with open(self.cache_file, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"LibraryManager: Error saving cache: {e}")
+
+    def _save_cache(self):
+        # Wrapper for saving current state
+        self._save_cache_data(self.albums)
+
+    def _find_art_for_folder(self, folder):
+        cover_filenames = ["cover.jpg", "Cover.jpg", "folder.jpg", "Folder.jpg", "cover.png", "Cover.png"]
+        for fn in cover_filenames:
+            path = os.path.join(folder, fn)
+            if os.path.exists(path):
+                try:
+                    with open(path, "rb") as f:
+                        return GLib.Bytes.new(f.read())
+                except:
+                    pass
+        return None
+
+    def _find_embedded_art(self, filepath):
+        """Extracts embedded album art from an audio file."""
+        try:
+            audio_raw = mutagen.File(filepath)
+            if not audio_raw or not audio_raw.tags:
+                return None
+            
+            art_bytes = None
+            if isinstance(audio_raw.tags, mutagen.id3.ID3) and 'APIC:' in audio_raw.tags:
+                art_bytes = audio_raw.tags['APIC:'].data
+            elif isinstance(audio_raw, mutagen.mp4.MP4) and 'covr' in audio_raw.tags and audio_raw.tags['covr']:
+                art_bytes = bytes(audio_raw.tags['covr'][0])
+            elif hasattr(audio_raw, 'pictures') and audio_raw.pictures:
+                art_bytes = audio_raw.pictures[0].data
+            
+            if art_bytes:
+                return GLib.Bytes.new(art_bytes)
+        except Exception as e:
+            print(f"LibraryManager: Error extracting embedded art from {filepath}: {e}")
+        return None
+
+
+class AlbumBrowser(Adw.Window):
+    def __init__(self, parent, library_manager, callback):
+        super().__init__(transient_for=parent, modal=True)
+        self.set_title("Album Browser")
+        self.set_icon_name("multimedia-audio-player")
+        self.set_default_size(450, 550)
+        self.callback = callback
+        self.library_manager = library_manager
+
+        self.albums_store = Gio.ListStore(item_type=Album)
+        self.filter_model = Gtk.FilterListModel(model=self.albums_store)
+        
+        # Sorting: Artist then Title
+        self.multi_sorter = Gtk.MultiSorter()
+        
+        artist_expression = Gtk.PropertyExpression.new(Album, None, "artist")
+        artist_sorter = Gtk.StringSorter.new(artist_expression)
+        self.multi_sorter.append(artist_sorter)
+        
+        title_expression = Gtk.PropertyExpression.new(Album, None, "title")
+        title_sorter = Gtk.StringSorter.new(title_expression)
+        self.multi_sorter.append(title_sorter)
+        
+        self.sort_model = Gtk.SortListModel(model=self.filter_model, sorter=self.multi_sorter)
+        self.selection_model = Gtk.SingleSelection(model=self.sort_model)
+
+        # Connect to library updates
+        self.library_manager.connect('library-updated', self._on_library_updated)
+        self.library_manager.connect('scan-started', lambda x: self.spinner.start())
+        self.library_manager.connect('scan-finished', lambda x: self.spinner.stop())
+        self._update_store()
+
+        # UI Setup
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        main_box.set_margin_start(12)
+        main_box.set_margin_end(12)
+        main_box.set_margin_top(12)
+        main_box.set_margin_bottom(12)
+        self.set_content(main_box)
+
+        self.search_entry = Gtk.SearchEntry()
+        self.search_entry.set_placeholder_text("Search Artist or Album...")
+        self.search_entry.connect("search-changed", self._on_search_changed)
+        main_box.append(self.search_entry)
+
+        lib_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        main_box.append(lib_box)
+        
+        self.lib_label = Gtk.Label(label=f"Library: {self.library_manager.library_path}", xalign=0)
+        self.lib_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        self.lib_label.set_hexpand(True)
+        lib_box.append(self.lib_label)
+
+        change_lib_btn = Gtk.Button(label="Change...")
+        change_lib_btn.connect("clicked", self._on_change_library_clicked)
+        lib_box.append(change_lib_btn)
+
+        re_scan_btn = Gtk.Button(label="Rescan")
+        re_scan_btn.connect("clicked", lambda x: self.library_manager.start_scan())
+        lib_box.append(re_scan_btn)
+
+        self.spinner = Gtk.Spinner()
+        self.spinner.set_margin_start(6)
+        lib_box.append(self.spinner)
+        if self.library_manager._is_scanning:
+            self.spinner.start()
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_vexpand(True)
+        main_box.append(scrolled)
+
+        factory = Gtk.SignalListItemFactory()
+        factory.connect("setup", self._on_item_setup)
+        factory.connect("bind", self._on_item_bind)
+
+        self.list_view = Gtk.ListView(model=self.selection_model, factory=factory)
+        self.list_view.add_css_class("navigation-sidebar")
+        self.list_view.connect("activate", lambda lv, pos: self._on_action_clicked(None, "play"))
+        scrolled.set_child(self.list_view)
+
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        button_box.set_halign(Gtk.Align.END)
+        main_box.append(button_box)
+
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.connect("clicked", lambda x: self.close())
+        button_box.append(cancel_button)
+
+        self.queue_button = Gtk.Button(label="Queue")
+        self.queue_button.connect("clicked", self._on_action_clicked, "queue")
+        self.queue_button.set_sensitive(False)
+        button_box.append(self.queue_button)
+
+        self.play_button = Gtk.Button(label="Play")
+        self.play_button.add_css_class("suggested-action")
+        self.play_button.connect("clicked", self._on_action_clicked, "play")
+        self.play_button.set_sensitive(False)
+        button_box.append(self.play_button)
+
+        self.selection_model.connect("selection-changed", self._on_selection_changed)
+        # Sync initial button state
+        self._on_selection_changed(self.selection_model, 0, 0)
+
+    def _update_store(self):
+        self.albums_store.remove_all()
+        for album in self.library_manager.albums:
+            self.albums_store.append(album)
+
+    def _on_library_updated(self, manager):
+        self._update_store()
+
+    def _on_item_setup(self, factory, list_item):
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        box.set_margin_start(6)
+        box.set_margin_end(6)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        
+        image = Gtk.Image()
+        image.set_pixel_size(48)
+        image.set_from_icon_name("audio-x-generic-symbolic")
+        box.append(image)
+
+        details = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        details.set_valign(Gtk.Align.CENTER)
+        box.append(details)
+
+        title_label = Gtk.Label(xalign=0)
+        title_label.add_css_class("title-4")
+        details.append(title_label)
+
+        artist_label = Gtk.Label(xalign=0)
+        artist_label.add_css_class("caption")
+        details.append(artist_label)
+
+        list_item.set_child(box)
+
+    def _on_item_bind(self, factory, list_item):
+        album = list_item.get_item()
+        box = list_item.get_child()
+        image = box.get_first_child()
+        details = image.get_next_sibling()
+        title_label = details.get_first_child()
+        artist_label = title_label.get_next_sibling()
+
+        title_label.set_label(album.title)
+        artist_label.set_label(album.artist)
+
+        if album.art_data:
+            try:
+                loader = GdkPixbuf.PixbufLoader()
+                loader.write(album.art_data.get_data())
+                loader.close()
+                pixbuf = loader.get_pixbuf()
+                scaled = pixbuf.scale_simple(48, 48, GdkPixbuf.InterpType.BILINEAR)
+                image.set_from_pixbuf(scaled)
+            except Exception:
+                image.set_from_icon_name("audio-x-generic-symbolic")
+        else:
+            image.set_from_icon_name("audio-x-generic-symbolic")
+
+    def _on_search_changed(self, entry):
+        search_text = entry.get_text().lower()
+        if not search_text:
+            self.filter_model.set_filter(None)
+            return
+
+        def filter_func(item):
+            return (search_text in item.title.lower() or 
+                    search_text in item.artist.lower())
+
+        custom_filter = Gtk.CustomFilter.new(filter_func)
+        self.filter_model.set_filter(custom_filter)
+
+    def _on_selection_changed(self, selection_model, position, n_items):
+        has_selection = selection_model.get_selected_item() is not None
+        self.play_button.set_sensitive(has_selection)
+        self.queue_button.set_sensitive(has_selection)
+
+    def _on_action_clicked(self, button, action):
+        album = self.selection_model.get_selected_item()
+        if album:
+            # Tell the parent about the library path in case it changed
+            if hasattr(self.get_transient_for(), 'library_path'):
+                self.get_transient_for().library_path = self.library_manager.library_path
+                self.get_transient_for()._save_settings()
+            
+            self.callback(album, action)
+            self.close()
+
+    def _on_change_library_clicked(self, button):
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Select Music Library Folder")
+        dialog.select_folder(parent=self, cancellable=None, callback=self._on_library_folder_selected)
+
+    def _on_library_folder_selected(self, dialog, result):
+        try:
+            folder = dialog.select_folder_finish(result)
+            if folder:
+                new_path = folder.get_path()
+                self.library_manager.library_path = new_path
+                self.lib_label.set_label(f"Library: {new_path}")
+                
+                # Tell parent to save new path
+                parent = self.get_transient_for()
+                if hasattr(parent, 'library_path'):
+                    parent.library_path = new_path
+                    parent._save_settings()
+                
+                self.library_manager.start_scan()
+        except Exception as e:
+            print(f"Error selecting library folder: {e}")
 
 
 
@@ -405,20 +868,46 @@ class MamoWindow(Adw.ApplicationWindow):
     PAUSE_ICON = "media-playback-pause-symbolic"
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+        self.set_title("Mamo")
+        self.set_default_size(500, 600)
         self.current_song = None
         self._playlist_file_path = os.path.expanduser("~/.config/mamo/playlist.json")
         self._settings_file_path = os.path.expanduser("~/.config/mamo/settings.json")
         self.duration_ns = 0 
+        self._waveform_cache_dir = os.path.expanduser("~/.cache/mamo/waveforms")
+        os.makedirs(self._waveform_cache_dir, exist_ok=True)
+        
         self._init_player()
-        self._setup_actions() 
-        self.mpris = MprisManager(self)
+        self._setup_actions()
         self._auto_play_after_load = False
         self._external_art_cache = {} # dirpath -> GLib.Bytes
+        self._active_analysis_uris = set()
+        self._analysis_queue = collections.deque()
+        self._analysis_worker_running = False
+        self._is_loading = False
+        self.mpris = None
+        self.library_manager = None
         
+        self.library_path = os.path.expanduser("~/Music")
         self._load_settings()
 
-        self.set_title("Mamo Music Player")
-        self.set_default_size(500, 600)
+        self._library_cache_path = os.path.expanduser("~/.cache/mamo/library.json")
+        
+        def deferred_init():
+            # Deferred MPRIS
+            self.mpris = MprisManager(self)
+            
+            # Deferred Library Manager
+            self.library_manager = LibraryManager(self.library_path, self._library_cache_path)
+            # If library is empty, trigger a scan
+            if not self.library_manager.albums:
+                print("MamoWindow: Library is empty, triggering initial scan.")
+                self.library_manager.start_scan()
+            return False
+
+        GLib.idle_add(deferred_init)
+
+        # Toast Overlay
 
         
         # Toast Overlay
@@ -445,14 +934,45 @@ class MamoWindow(Adw.ApplicationWindow):
         status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         status_box.set_halign(Gtk.Align.CENTER)
         
+        button_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        button_container.set_halign(Gtk.Align.CENTER)
+        status_box.append(button_container)
+
+        add_file_btn = Gtk.Button(label="Add File")
+        add_file_btn.add_css_class("pill")
+        add_file_btn.connect("clicked", self._on_add_file_clicked)
+        button_container.append(add_file_btn)
+
         add_folder_pill = Gtk.Button(label="Add Folder")
         add_folder_pill.add_css_class("pill")
-        add_folder_pill.add_css_class("suggested-action")
         add_folder_pill.connect("clicked", self._on_add_clicked)
-        status_box.append(add_folder_pill)
+        button_container.append(add_folder_pill)
+        
+        browse_music_btn = Gtk.Button(label="Browse Music")
+        browse_music_btn.add_css_class("pill")
+        browse_music_btn.add_css_class("suggested-action")
+        browse_music_btn.connect("clicked", self._on_play_album_clicked)
+        button_container.append(browse_music_btn)
         
         status_page.set_child(status_box)
         self.main_stack.add_named(status_page, "empty")
+
+        # 3. Loading Page
+        loading_page = Adw.StatusPage()
+        loading_page.set_icon_name("folder-music-symbolic")
+        loading_page.set_title("Loading...")
+        loading_page.set_description("Please wait while we load your music.")
+        
+        loading_spinner = Gtk.Spinner()
+        loading_spinner.start()
+        loading_spinner.set_halign(Gtk.Align.CENTER)
+        
+        loading_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        loading_box.set_halign(Gtk.Align.CENTER)
+        loading_box.append(loading_spinner)
+        
+        loading_page.set_child(loading_box)
+        self.main_stack.add_named(loading_page, "loading")
 
         # 2. Main Player View works (Box)
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -462,17 +982,17 @@ class MamoWindow(Adw.ApplicationWindow):
         playback_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         playback_box.add_css_class("linked") 
 
-        prev_button = Gtk.Button.new_from_icon_name("media-skip-backward-symbolic")
-        prev_button.connect("clicked", self._on_prev_clicked)
-        playback_box.append(prev_button)
+        self.prev_button = Gtk.Button.new_from_icon_name("media-skip-backward-symbolic")
+        self.prev_button.connect("clicked", self._on_prev_clicked)
+        playback_box.append(self.prev_button)
 
         self.play_pause_button = Gtk.Button.new_from_icon_name("media-playback-start-symbolic")
         self.play_pause_button.connect("clicked", self.toggle_play_pause)
         playback_box.append(self.play_pause_button)
 
-        next_button = Gtk.Button.new_from_icon_name("media-skip-forward-symbolic")
-        next_button.connect("clicked", self._on_next_clicked)
-        playback_box.append(next_button)
+        self.next_button = Gtk.Button.new_from_icon_name("media-skip-forward-symbolic")
+        self.next_button.connect("clicked", self._on_next_clicked)
+        playback_box.append(self.next_button)
 
         header.pack_start(playback_box)
 
@@ -482,11 +1002,13 @@ class MamoWindow(Adw.ApplicationWindow):
         main_menu.append("Open Playlist", "win.open_playlist")
         main_menu.append("Save Playlist", "win.save_playlist")
         main_menu.append("Add Folder...", "win.add_folder_new") 
+        main_menu.append("Add Files...", "win.add_file")
         main_menu.append("Clear Playlist", "win.clear_playlist")
         
         section = Gio.Menu()
         section.append("Use Dark Mode", "win.dark_mode")
         section.append("Auto Play", "win.auto_play")
+        section.append("Loop All", "win.loop_all")
         section.append("Clear Playlist on Start", "win.clear_on_start")
         section.append("About", "win.about")
         main_menu.append_section(None, section)
@@ -495,16 +1017,11 @@ class MamoWindow(Adw.ApplicationWindow):
         menu_button.set_icon_name("open-menu-symbolic")
         menu_button.set_menu_model(main_menu) 
 
-        add_button = Gtk.Button.new_from_icon_name("list-add-symbolic")
-        add_button.connect("clicked", self._on_add_clicked)
-        add_button.set_tooltip_text("Add Music Files")
-
         play_album_button = Gtk.Button.new_from_icon_name("folder-music-symbolic")
         play_album_button.connect("clicked", self._on_play_album_clicked)
-        play_album_button.set_tooltip_text("Add Album and Play")
+        play_album_button.set_tooltip_text("Album Browser")
 
         header.pack_end(menu_button) 
-        header.pack_end(add_button)
         header.pack_end(play_album_button)
 
         song_info_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
@@ -583,6 +1100,7 @@ class MamoWindow(Adw.ApplicationWindow):
 
         self.selection_model = Gtk.SingleSelection(model=self.playlist_store)
         self.selection_model.connect("selection-changed", self._on_playlist_selection_changed)
+        self.selection_model.connect("selection-changed", lambda *a: self._update_playback_controls_sensitivity())
         # Removed remaining time update signal
 
         self.playlist_view = Gtk.ListView(model=self.selection_model,
@@ -605,6 +1123,7 @@ class MamoWindow(Adw.ApplicationWindow):
         
         
         self.playlist_store.connect("items-changed", self._update_viewport) 
+        self.playlist_store.connect("items-changed", lambda *a: self._update_playback_controls_sensitivity())
         
         clear_on_start = self.action_group.get_action_state("clear_on_start").get_boolean()
         if not clear_on_start:
@@ -618,12 +1137,37 @@ class MamoWindow(Adw.ApplicationWindow):
 
     def _update_viewport(self, model=None, position=None, removed=None, added=None):
         """Switches between empty state and player view based on playlist content."""
-        if self.playlist_store.get_n_items() > 0:
+        if self._is_loading:
+            self.main_stack.set_visible_child_name("loading")
+            self.play_pause_button.set_sensitive(False)
+        elif self.playlist_store.get_n_items() > 0:
             self.main_stack.set_visible_child_name("player")
             self.play_pause_button.set_sensitive(True) 
+            self._update_playback_controls_sensitivity()
         else:
             self.main_stack.set_visible_child_name("empty")
             self.play_pause_button.set_sensitive(False) 
+            self._update_playback_controls_sensitivity()
+
+    def _update_playback_controls_sensitivity(self):
+        """Updates the sensitivity of Previous and Next buttons."""
+        n_items = self.playlist_store.get_n_items()
+        if n_items == 0:
+            self.prev_button.set_sensitive(False)
+            self.next_button.set_sensitive(False)
+            return
+
+        loop_all = self.action_group.get_action_state("loop_all").get_boolean()
+        current_pos = self.selection_model.get_selected()
+
+        if loop_all:
+            self.prev_button.set_sensitive(True)
+            self.next_button.set_sensitive(True)
+        else:
+            # Not looping: disable buttons at boundaries
+            has_pos = current_pos != Gtk.INVALID_LIST_POSITION
+            self.prev_button.set_sensitive(has_pos and current_pos > 0)
+            self.next_button.set_sensitive(current_pos < (n_items - 1) or not has_pos)
 
     
     def _setup_actions(self):
@@ -640,6 +1184,10 @@ class MamoWindow(Adw.ApplicationWindow):
         add_folder_action = Gio.SimpleAction.new("add_folder_new", None) 
         add_folder_action.connect("activate", self._on_add_folder_action)
         action_group.add_action(add_folder_action)
+
+        add_file_action = Gio.SimpleAction.new("add_file", None)
+        add_file_action.connect("activate", self._on_add_file_action)
+        action_group.add_action(add_file_action)
 
         clear_action = Gio.SimpleAction.new("clear_playlist", None)
         clear_action.connect("activate", self._on_clear_playlist_action)
@@ -672,6 +1220,11 @@ class MamoWindow(Adw.ApplicationWindow):
         repeat_action = Gio.SimpleAction.new_stateful("repeat", None, GLib.Variant.new_boolean(False))
         repeat_action.connect("activate", self._on_repeat_action_activated)
         action_group.add_action(repeat_action)
+
+        # Stateful loop all action
+        loop_all_action = Gio.SimpleAction.new_stateful("loop_all", None, GLib.Variant.new_boolean(False))
+        loop_all_action.connect("activate", self._on_loop_all_action_activated)
+        action_group.add_action(loop_all_action)
 
         self.action_group = action_group
         self.insert_action_group("win", action_group)
@@ -1056,17 +1609,48 @@ class MamoWindow(Adw.ApplicationWindow):
         return False 
 
     def _on_add_clicked(self, button):
-        """Handles the Add button click: shows a Gtk.FileDialog."""
-        # Standard "Add" should NOT autoplay, even if the setting is on, 
-        # as it interrupts current playback and causes UI glitches.
+        """Handles the Add Folder pill click."""
         self._auto_play_after_load = False
         self._on_add_folder_action(None, None)
 
+    def _on_add_file_clicked(self, button):
+        """Handles the Add File button click."""
+        self._auto_play_after_load = False
+        self._show_file_dialog()
+
     def _on_play_album_clicked(self, button):
-        """Handles the Play Album button click: adds folder and starts playback."""
-        print("Play Album clicked. Appending to playlist.")
-        self._auto_play_after_load = True
-        self._on_add_folder_action(None, None)
+        """Handles the Play Album button click: opens the Album Browser."""
+        if not self.library_manager:
+            print("LibraryManager not yet initialized.")
+            return
+
+        print("Play Album clicked. Opening Browser.")
+        browser = AlbumBrowser(self, self.library_manager, self._on_album_browser_callback)
+        browser.present()
+
+    def _on_album_browser_callback(self, album, action):
+        """Callback from AlbumBrowser."""
+        print(f"AlbumBrowser callback: {album.title} by {album.artist}, Action: {action}")
+        
+        if action == "play":
+            # Don't remove_all() anymore, just stop current playback so the new album can start
+            if self.player:
+                self.player.set_state(Gst.State.NULL)
+            self.current_song = None
+            self._update_song_display(None)
+
+        # Add all audio files from folder
+        folder = album.folder
+        if os.path.isdir(folder):
+            for fn in sorted(os.listdir(folder)):
+                if fn.lower().endswith(('.mp3', '.flac', '.m4a', '.ogg')):
+                    uri = pathlib.Path(os.path.join(folder, fn)).as_uri()
+                    self._discover_and_add_uri(uri)
+            
+            if action == "play":
+                # Wait a bit for discovery or just rely on auto_play logic if we had it
+                # For now, let's set a flag to play the first item added
+                self._auto_play_after_load = True
 
     def _show_file_dialog(self):
         """Internal helper to show the file dialog."""
@@ -1450,6 +2034,9 @@ class MamoWindow(Adw.ApplicationWindow):
             GLib.idle_add(self.playlist_store.append, song_to_add)
             print(f"Scheduled add for: {final_title or 'Unknown Title'}")
 
+            # Start background waveform analysis
+            self._start_waveform_analysis(song_to_add)
+
             # Auto-play if requested via internal flag OR menu setting
             auto_play_enabled = self.action_group.get_action_state("auto_play").get_boolean()
             if self._auto_play_after_load or auto_play_enabled:
@@ -1558,6 +2145,10 @@ class MamoWindow(Adw.ApplicationWindow):
                         avg_db = sum(rms_list) / len(rms_list)
                         linear = pow(10, avg_db / 20.0)
 
+                        if self.current_song.waveform_data is not None and len(self.current_song.waveform_data) > 0:
+                            # Use pre-generated or already fully populated data
+                            return True
+
                         if self.current_song.waveform_data is None:
                             self.current_song.waveform_data = []
 
@@ -1634,6 +2225,8 @@ class MamoWindow(Adw.ApplicationWindow):
              self._last_indicated_song = None
 
         if song:
+            # Ensure background analysis starts if missing
+            self._start_waveform_analysis(song)
             
             self.song_label.set_label(song.title)
             self.song_label.set_tooltip_text(song.title)
@@ -1682,6 +2275,139 @@ class MamoWindow(Adw.ApplicationWindow):
             self.time_label_current.set_label("0:00")
             self.time_label_remaining.set_label("-0:00")
             self.waveform.set_waveform_data([])
+
+    def _start_waveform_analysis(self, song):
+        """Adds a song to the background analysis queue."""
+        if song.waveform_data or song.uri in self._active_analysis_uris:
+            return
+
+        # Check cache first
+        cached_data = self._load_waveform_from_cache(song)
+        if cached_data:
+            song.waveform_data = cached_data
+            if self.current_song == song:
+                GLib.idle_add(lambda: self.waveform.set_waveform_data(song.waveform_data))
+            return
+            
+        self._active_analysis_uris.add(song.uri)
+        self._analysis_queue.append(song)
+        
+        if not self._analysis_worker_running:
+            self._analysis_worker_running = True
+            thread = threading.Thread(target=self._analysis_worker_loop, daemon=True)
+            thread.start()
+
+    def _analysis_worker_loop(self):
+        """Worker thread that processes the analysis queue one by one."""
+        while self._analysis_queue:
+            song = self._analysis_queue.popleft()
+            try:
+                self._analyze_waveform_thread(song)
+            except Exception as e:
+                print(f"Analysis worker error: {e}")
+        self._analysis_worker_running = False
+
+    def _analyze_waveform_thread(self, song):
+        """Background thread to scan the audio file and generate waveform data."""
+        uri = song.uri
+        # Use uridecodebin and level for fast scanning. 50ms interval for good detail.
+        pipeline_str = f"uridecodebin uri=\"{uri}\" ! audioconvert ! level interval=50000000 post-messages=true ! fakesink"
+        try:
+            pipeline = Gst.parse_launch(pipeline_str)
+            if not pipeline:
+                print(f"Failed to create analysis pipeline for {uri}")
+                self._active_analysis_uris.discard(uri)
+                return
+
+            bus = pipeline.get_bus()
+            pipeline.set_state(Gst.State.PLAYING)
+            
+            waveform_data = []
+            
+            while True:
+                msg = bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, 
+                                           Gst.MessageType.EOS | Gst.MessageType.ERROR | Gst.MessageType.ELEMENT)
+                if not msg:
+                    break
+                
+                t = msg.type
+                if t == Gst.MessageType.EOS:
+                    break
+                elif t == Gst.MessageType.ERROR:
+                    err, dbg = msg.parse_error()
+                    print(f"Waveform Analysis Error for {uri}: {err.message}")
+                    break
+                elif t == Gst.MessageType.ELEMENT:
+                    struct = msg.get_structure()
+                    if struct and struct.get_name() == "level":
+                        rms_list = struct.get_value("rms")
+                        if rms_list:
+                            avg_db = sum(rms_list) / len(rms_list)
+                            linear = pow(10, avg_db / 20.0)
+                            waveform_data.append(linear)
+            
+            pipeline.set_state(Gst.State.NULL)
+            
+            if waveform_data:
+                song.waveform_data = waveform_data
+                GLib.idle_add(self._on_waveform_analysis_finished, song)
+            
+            self._active_analysis_uris.discard(uri)
+                
+        except Exception as e:
+            print(f"Unexpected error in waveform analysis for {uri}: {e}")
+            if hasattr(self, "_active_analysis_uris"):
+                self._active_analysis_uris.discard(uri)
+
+    def _on_waveform_analysis_finished(self, song):
+        """Triggered on main thread when analysis is done."""
+        if song.waveform_data:
+            self._save_waveform_to_cache(song, song.waveform_data)
+
+        if self.current_song == song:
+            self.waveform.set_waveform_data(song.waveform_data)
+        self._schedule_playlist_save()
+
+    def _schedule_playlist_save(self):
+        """Schedules a playlist save with debouncing (2 seconds)."""
+        if self._save_timer_id is not None:
+            GLib.source_remove(self._save_timer_id)
+        self._save_timer_id = GLib.timeout_add_seconds(2, self._debounced_save)
+
+    def _debounced_save(self):
+        """Timer callback to perform the actual save."""
+        self._save_timer_id = None
+        self._save_playlist()
+        return False
+
+    def _get_song_hash(self, song):
+        """Generates a SHA256 hash for the song URI to use as a cache key."""
+        return hashlib.sha256(song.uri.encode('utf-8')).hexdigest()
+
+    def _load_waveform_from_cache(self, song):
+        """Attempts to load waveform data from the disk cache."""
+        song_hash = self._get_song_hash(song)
+        cache_path = os.path.join(self._waveform_cache_dir, f"{song_hash}.json")
+        
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"Error loading waveform cache for {song.uri}: {e}")
+        return None
+
+    def _save_waveform_to_cache(self, song, data):
+        """Saves waveform data to the disk cache."""
+        if not data:
+            return
+        song_hash = self._get_song_hash(song)
+        cache_path = os.path.join(self._waveform_cache_dir, f"{song_hash}.json")
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"Error saving waveform cache for {song.uri}: {e}")
 
 
     
@@ -1755,17 +2481,26 @@ class MamoWindow(Adw.ApplicationWindow):
         can_seek, position_ns = self.player.query_position(Gst.Format.TIME)
         state = self.player.get_state(0).state
 
-        
+        # If playing past 3 seconds, seek to start
         if state in (Gst.State.PLAYING, Gst.State.PAUSED) and can_seek and position_ns > (3 * Gst.SECOND):
             print("Previous: Seeking to beginning.")
             seek_flags = Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT
             self.player.seek_simple(Gst.Format.TIME, seek_flags, 0)
         else:
-            
             print("Previous: Selecting previous track.")
             current_pos = self.selection_model.get_selected()
+            n_items = self.playlist_store.get_n_items()
+            if n_items == 0: return
+
+            new_pos = Gtk.INVALID_LIST_POSITION
             if current_pos != Gtk.INVALID_LIST_POSITION and current_pos > 0:
                 new_pos = current_pos - 1
+            elif (current_pos == 0 or current_pos == Gtk.INVALID_LIST_POSITION) and n_items > 0:
+                loop_all = self.action_group.get_action_state("loop_all").get_boolean()
+                if loop_all or current_pos == Gtk.INVALID_LIST_POSITION:
+                    new_pos = n_items - 1
+            
+            if new_pos != Gtk.INVALID_LIST_POSITION:
                 self.selection_model.set_selected(new_pos)
                 song = self.playlist_store.get_item(new_pos)
                 if song and song.uri:
@@ -1779,19 +2514,22 @@ class MamoWindow(Adw.ApplicationWindow):
         if n_items == 0: return 
 
         current_pos = self.selection_model.get_selected()
+        new_pos = Gtk.INVALID_LIST_POSITION
 
         if current_pos != Gtk.INVALID_LIST_POSITION and current_pos < (n_items - 1):
             new_pos = current_pos + 1
+        elif (current_pos == (n_items - 1) or current_pos == Gtk.INVALID_LIST_POSITION) and n_items > 0:
+            loop_all = self.action_group.get_action_state("loop_all").get_boolean()
+            if loop_all or current_pos == Gtk.INVALID_LIST_POSITION:
+                new_pos = 0
+            else:
+                print("End of playlist reached, loop_all is OFF.")
+        
+        if new_pos != Gtk.INVALID_LIST_POSITION:
             self.selection_model.set_selected(new_pos)
             song = self.playlist_store.get_item(new_pos)
             if song and song.uri:
                 self.play_uri(song.uri)
-        elif current_pos == Gtk.INVALID_LIST_POSITION and n_items > 0:
-             
-             self.selection_model.set_selected(0)
-             song = self.playlist_store.get_item(0)
-             if song and song.uri:
-                 self.play_uri(song.uri)
         
 
     
@@ -1883,6 +2621,10 @@ class MamoWindow(Adw.ApplicationWindow):
                 
 
     
+    def _on_add_file_action(self, action, param):
+        """Handles the 'win.add_file' action."""
+        self._auto_play_after_load = False
+        self._show_file_dialog()
 
     def _on_add_folder_action(self, action, param): 
         """Handles the 'win.add_folder_new' action."""
@@ -1975,6 +2717,13 @@ class MamoWindow(Adw.ApplicationWindow):
                     if rep_action:
                         rep_action.change_state(GLib.Variant.new_boolean(repeat_val))
 
+                    loop_all_val = settings.get("loop_all", False)
+                    la_action = self.action_group.lookup_action("loop_all")
+                    if la_action:
+                        la_action.change_state(GLib.Variant.new_boolean(loop_all_val))
+
+                    self.library_path = settings.get("library_path", os.path.expanduser("~/Music"))
+
             except Exception as e:
                 print(f"Error loading settings: {e}", file=sys.stderr)
 
@@ -1985,7 +2734,9 @@ class MamoWindow(Adw.ApplicationWindow):
             "dark_mode": self.action_group.get_action_state("dark_mode").get_boolean(),
             "auto_play": self.action_group.get_action_state("auto_play").get_boolean(),
             "clear_on_start": self.action_group.get_action_state("clear_on_start").get_boolean(),
-            "repeat": self.action_group.get_action_state("repeat").get_boolean()
+            "repeat": self.action_group.get_action_state("repeat").get_boolean(),
+            "loop_all": self.action_group.get_action_state("loop_all").get_boolean(),
+            "library_path": self.library_path
         }
         try:
             with open(self._settings_file_path, 'w') as f:
@@ -2024,6 +2775,15 @@ class MamoWindow(Adw.ApplicationWindow):
         print(f"Repeat toggled to: {new_state}")
         self._save_settings()
 
+    def _on_loop_all_action_activated(self, action, parameter):
+        """Toggles loop all setting."""
+        state = action.get_state().get_boolean()
+        new_state = not state
+        action.change_state(GLib.Variant.new_boolean(new_state))
+        print(f"Loop All toggled to: {new_state}")
+        self._save_settings()
+        self._update_playback_controls_sensitivity()
+
     def _apply_dark_mode(self, enabled):
         """Applies dark mode using Libadwaita StyleManager."""
         style_manager = Adw.StyleManager.get_default()
@@ -2033,7 +2793,7 @@ class MamoWindow(Adw.ApplicationWindow):
             style_manager.set_color_scheme(Adw.ColorScheme.PREFER_LIGHT)
 
     def _load_playlist(self, filepath=None):
-        """Loads the playlist from a JSON file. Uses default if filepath is None."""
+        """Loads the playlist from a JSON file in a background thread."""
         path_to_use = filepath if filepath else self._playlist_file_path
 
         if not os.path.exists(path_to_use):
@@ -2043,47 +2803,61 @@ class MamoWindow(Adw.ApplicationWindow):
                  print("Default playlist file not found, starting empty.")
             return
 
-        print(f"Loading playlist from: {path_to_use}")
-        try:
-            with open(path_to_use, 'r') as f:
-                playlist_data = json.load(f)
+        self._is_loading = True
+        self._update_viewport()
 
-            if not isinstance(playlist_data, list):
-                 print("Warning: Invalid playlist format (not a list). Starting empty.")
-                 return
+        def background_load():
+            songs_to_add = []
+            try:
+                print(f"Loading playlist from: {path_to_use}")
+                with open(path_to_use, 'r') as f:
+                    playlist_data = json.load(f)
 
-            for item in playlist_data:
-                if isinstance(item, dict):
-                     
-                     duration_ns_loaded = item.get('duration_ns')
-                     if not isinstance(duration_ns_loaded, int) or duration_ns_loaded < 0:
-                         duration_ns_loaded = 0
+                if isinstance(playlist_data, list):
+                    for item in playlist_data:
+                        if isinstance(item, dict):
+                            duration_ns_loaded = item.get('duration_ns', 0)
+                            if not isinstance(duration_ns_loaded, int) or duration_ns_loaded < 0:
+                                duration_ns_loaded = 0
 
-                     
-                     album_art_glib_bytes = None
-                     album_art_b64 = item.get('album_art_b64')
-                     if album_art_b64:
-                         try:
-                             decoded_bytes = base64.b64decode(album_art_b64)
-                             album_art_glib_bytes = GLib.Bytes.new(decoded_bytes)
-                         except Exception as decode_e:
-                             print(f"Error decoding album art for {item.get('title')}: {decode_e}")
+                            album_art_glib_bytes = None
+                            album_art_b64 = item.get('album_art_b64')
+                            if album_art_b64:
+                                try:
+                                    decoded_bytes = base64.b64decode(album_art_b64)
+                                    album_art_glib_bytes = GLib.Bytes.new(decoded_bytes)
+                                except Exception: pass
 
-                     song = Song(uri=item.get('uri'),
-                                 title=item.get('title'),
-                                 artist=item.get('artist'),
-                                 duration=duration_ns_loaded)
-                     
-                     if album_art_glib_bytes:
-                         song.album_art_data = album_art_glib_bytes
-                     self.playlist_store.append(song)
-                else:
-                     print(f"Warning: Skipping invalid item in playlist: {item}")
+                            song = Song(uri=item.get('uri'),
+                                         title=item.get('title'),
+                                         artist=item.get('artist'),
+                                         duration=duration_ns_loaded)
+                            
+                            if album_art_glib_bytes:
+                                song.album_art_data = album_art_glib_bytes
+                            
+                            song.waveform_data = self._load_waveform_from_cache(song)
+                            if not song.waveform_data:
+                                song.waveform_data = item.get('waveform_data')
+                            
+                            songs_to_add.append(song)
+            except Exception as e:
+                print(f"Error in background playlist load: {e}", file=sys.stderr)
+            
+            GLib.idle_add(self._apply_loaded_playlist, songs_to_add)
 
-        except json.JSONDecodeError:
-            print(f"Error: Could not decode playlist JSON from {path_to_use}. Starting empty.")
-        except Exception as e:
-            print(f"Error loading playlist from {path_to_use}: {e}", file=sys.stderr)
+        thread = threading.Thread(target=background_load, daemon=True)
+        thread.start()
+
+    def _apply_loaded_playlist(self, songs):
+        """Called on main thread to populate the playlist store."""
+        # Only remove all if it's a full playlist load (we might want to change this)
+        self.playlist_store.remove_all()
+        for s in songs:
+            self.playlist_store.append(s)
+        self._is_loading = False
+        self._update_viewport()
+        self._update_song_display(None)
 
         # Trigger background repair for 0-duration items
         threading.Thread(target=self._repair_playlist_durations, daemon=True).start()
@@ -2119,8 +2893,12 @@ class MamoWindow(Adw.ApplicationWindow):
                     except Exception as e:
                         print(f"Error repairing duration for {path}: {e}")
 
+            # Trigger waveform analysis if missing
+            if song and song.duration > 0 and not song.waveform_data:
+                self._start_waveform_analysis(song)
+
         if needs_save:
-            GLib.idle_add(self._save_playlist)
+            GLib.idle_add(self._schedule_playlist_save)
 
     def _uri_to_path(self, uri):
         try:
@@ -2143,7 +2921,7 @@ class MamoWindow(Adw.ApplicationWindow):
                 'uri': song.uri,
                 'title': song.title,
                 'artist': song.artist,
-                'duration_ns': duration_to_save 
+                'duration_ns': duration_to_save
             }
             
             if song.album_art_data:
@@ -2173,33 +2951,50 @@ class MamoWindow(Adw.ApplicationWindow):
 class MamoApplication(Adw.Application):
     def __init__(self, **kwargs):
         super().__init__(application_id='org.broomlabs.MamoMusicPlayer',
-                         flags=Gio.ApplicationFlags.FLAGS_NONE,
+                         flags=Gio.ApplicationFlags.HANDLES_OPEN,
                         **kwargs)
-        GLib.set_application_name("Mamo Music Player")
+        GLib.set_prgname("mamo")
+        GLib.set_application_name("Mamo")
+        Gtk.Window.set_default_icon_name("multimedia-audio-player")
         self.window = None
 
     def do_activate(self):
-        
         if not self.window:
             self.window = MamoWindow(application=self)
         self.window.present()
 
+    def do_open(self, files, n_files, hint):
+        """Handles opening files and folders from the system."""
+        if not self.window:
+            self.window = MamoWindow(application=self)
+        self.window.present()
+        
+        # Set autoplay if these are the first files being added
+        is_empty = self.window.playlist_store.get_n_items() == 0
+        if is_empty:
+            self.window._auto_play_after_load = True
+
+        for i in range(n_files):
+            f = files[i]
+            try:
+                info = f.query_info(Gio.FILE_ATTRIBUTE_STANDARD_TYPE, Gio.FileQueryInfoFlags.NONE, None)
+                if info.get_file_type() == Gio.FileType.DIRECTORY:
+                    self.window._start_folder_scan(f)
+                else:
+                    self.window._discover_and_add_uri(f.get_uri())
+            except Exception as e:
+                print(f"Error handling file '{f.get_uri()}': {e}", file=sys.stderr)
+
     def do_startup(self):
         Adw.Application.do_startup(self)
 
-        
         provider = Gtk.CssProvider()
-        css_file = os.path.join(os.path.dirname(__file__), "style.css") 
-        if os.path.exists(css_file):
-            provider.load_from_path(css_file)
-            print(f"Loading CSS from: {css_file}")
-            Gtk.StyleContext.add_provider_for_display(
-                Gdk.Display.get_default(),
-                provider,
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-            )
-        else:
-            print(f"Warning: style.css not found at {css_file}", file=sys.stderr)
+        provider.load_from_data(STYLE_CSS.encode('utf-8'))
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
     def do_shutdown(self):
         

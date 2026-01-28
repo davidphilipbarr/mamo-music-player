@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Mamo
+Comment=Modern Music Player
+Exec=python3 /home/david/Projects/gnome/Mamo/mamo.py %U
+Icon=org.broomlabs.MamoMusicPlayer
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Player;Qt;GTK;
+MimeType=audio/mpeg;audio/flac;audio/ogg;audio/mp4;audio/wav;inode/directory;
+X-GNOME-UsesNotifications=true
