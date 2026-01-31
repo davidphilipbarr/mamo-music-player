@@ -136,6 +136,8 @@ class LibraryManager(GObject.Object):
     def _load_cache_thread(self):
         """Background thread to load the library cache."""
         if not os.path.exists(self.cache_file):
+            print("LibraryManager: No cache found, starting initial scan.")
+            GLib.idle_add(self.start_scan)
             return
         
         self._is_loading_cache = True
@@ -208,7 +210,7 @@ class LibraryManager(GObject.Object):
         found_albums = {} # (artist, title) -> Album
 
         for root, dirs, files in os.walk(self.library_path):
-            audio_files = [f for f in files if f.lower().endswith(('.mp3', '.flac', '.m4a', '.ogg'))]
+            audio_files = [f for f in files if not f.startswith('.') and f.lower().endswith(('.mp3', '.flac', '.m4a', '.ogg'))]
             if audio_files:
                 first_file = os.path.join(root, audio_files[0])
                 try:
@@ -234,6 +236,11 @@ class LibraryManager(GObject.Object):
         final_albums = list(found_albums.values())
         self._save_cache_data(final_albums)
         GLib.idle_add(self._on_scan_complete, final_albums)
+
+    def _on_partial_update(self, albums):
+        self.albums = albums
+        self.emit('library-updated')
+        return False
 
     def _on_scan_complete(self, albums):
         self.albums = albums
@@ -726,7 +733,7 @@ class MprisManager:
             return
 
         for interface in self.node_info.interfaces:
-            reg_id = connection.register_object(
+            reg_id = connection.register_object_with_closures2(
                 "/org/mpris/MediaPlayer2",
                 interface,
                 self._handle_method_call,
@@ -871,6 +878,12 @@ class MamoWindow(Adw.ApplicationWindow):
         self.set_title("Mamo")
         self.set_default_size(500, 600)
         self.current_song = None
+        self._last_indicated_song = None
+        self._auto_play_after_load = False
+        self._save_timer_id = None
+        self._progress_timer_id = None
+        self._waveform_push_ctr = 0
+        self._is_switching = False
         self._playlist_file_path = os.path.expanduser("~/.config/mamo/playlist.json")
         self._settings_file_path = os.path.expanduser("~/.config/mamo/settings.json")
         self.duration_ns = 0 
@@ -899,10 +912,6 @@ class MamoWindow(Adw.ApplicationWindow):
             
             # Deferred Library Manager
             self.library_manager = LibraryManager(self.library_path, self._library_cache_path)
-            # If library is empty, trigger a scan
-            if not self.library_manager.albums:
-                print("MamoWindow: Library is empty, triggering initial scan.")
-                self.library_manager.start_scan()
             return False
 
         GLib.idle_add(deferred_init)
@@ -1097,6 +1106,7 @@ class MamoWindow(Adw.ApplicationWindow):
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", self._on_playlist_item_setup)
         factory.connect("bind", self._on_playlist_item_bind)
+        factory.connect("unbind", self._on_playlist_item_unbind)
 
         self.selection_model = Gtk.SingleSelection(model=self.playlist_store)
         self.selection_model.connect("selection-changed", self._on_playlist_selection_changed)
@@ -1284,31 +1294,45 @@ class MamoWindow(Adw.ApplicationWindow):
 
     def play_uri(self, uri):
         """Loads and starts playing a URI."""
-        if not self.player:
-            self.current_song = None
+        if self._is_switching:
+            print(f"play_uri: already switching, ignoring request for {uri}")
             return
-
-        
-        self.current_song = None
-        for i in range(self.playlist_store.get_n_items()):
-             song = self.playlist_store.get_item(i)
-             if song.uri == uri:
-                 self.current_song = song
-                 break
-
-        self._update_song_display(self.current_song)
-        self.mpris.update_metadata(self.current_song)
-        self.mpris.update_playback_status()
-        
-        print(f"Playing URI: {uri}")
-        self.player.set_property("uri", uri)
-        self.player.set_state(Gst.State.PLAYING)
-        
-        self.play_pause_button.set_icon_name(self.PAUSE_ICON)
-        
-        self.play_pause_button.set_icon_name(self.PAUSE_ICON)
-        
-        self.duration_ns = 0 
+            
+        self._is_switching = True
+        try:
+            if not self.player:
+                self.current_song = None
+                return
+    
+            
+            self.current_song = None
+            n = self.playlist_store.get_n_items()
+            for i in range(n):
+                 song = self.playlist_store.get_item(i)
+                 if song.uri == uri:
+                     self.current_song = song
+                     break
+    
+            print(f"play_uri: uri={uri} target_found={self.current_song is not None}")
+            if self.current_song:
+                 print(f"play_uri: song_title='{self.current_song.title}'")
+    
+            self._update_song_display(self.current_song)
+            self.mpris.update_metadata(self.current_song)
+            self.mpris.update_playback_status()
+            
+            print(f"Playing URI: {uri}")
+            self.player.set_property("uri", uri)
+            self.player.set_state(Gst.State.PLAYING)
+            
+            self.play_pause_button.set_icon_name(self.PAUSE_ICON)
+            
+            self.play_pause_button.set_icon_name(self.PAUSE_ICON)
+            
+            self.duration_ns = 0
+            self._auto_play_after_load = False
+        finally:
+            self._is_switching = False 
         
 
     def toggle_play_pause(self, button=None):
@@ -1339,8 +1363,8 @@ class MamoWindow(Adw.ApplicationWindow):
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         box.set_margin_start(6)
         box.set_margin_end(6)
-        box.set_margin_top(3)
-        box.set_margin_bottom(3)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
 
         # "Now Playing" indicator icon wrapped in a fixed-width box to prevent shifting
         indicator_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -1348,14 +1372,15 @@ class MamoWindow(Adw.ApplicationWindow):
         indicator_container.set_valign(Gtk.Align.CENTER)
         indicator_container.set_halign(Gtk.Align.CENTER)
 
-        status_icon = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic")
+        status_icon = Gtk.Image.new_from_icon_name("media-playback-start-symbolic")
         status_icon.set_visible(False)
+        list_item._status_icon = status_icon
         status_icon.add_css_class("now-playing-indicator")
         indicator_container.append(status_icon)
         box.append(indicator_container)
 
         # Container for vertical labels
-        label_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        label_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         label_box.set_valign(Gtk.Align.CENTER)
         label_box.set_hexpand(True)
 
@@ -1410,7 +1435,16 @@ class MamoWindow(Adw.ApplicationWindow):
         song = list_item.get_item() 
 
         # Bind is_playing to status_icon visibility
-        song.bind_property("is_playing", status_icon, "visible", GObject.BindingFlags.SYNC_CREATE)
+        # Use the stored status_icon and handle previous bindings to prevent leaks in recycled rows
+        status_icon = getattr(list_item, "_status_icon", None)
+        if not status_icon:
+            indicator_container = box.get_first_child()
+            status_icon = indicator_container.get_first_child()
+
+        if hasattr(list_item, "_playing_binding") and list_item._playing_binding:
+            list_item._playing_binding.unbind()
+            
+        list_item._playing_binding = song.bind_property("is_playing", status_icon, "visible", GObject.BindingFlags.SYNC_CREATE)
 
         title_label.set_label(song.title)
         
@@ -1449,6 +1483,12 @@ class MamoWindow(Adw.ApplicationWindow):
                 except TypeError: pass
             new_handler_id_right = gesture_right.connect("pressed", self._on_song_row_right_clicked, song, list_item)
             list_item._right_click_handler_id = new_handler_id_right
+
+    def _on_playlist_item_unbind(self, factory, list_item):
+        """Unbind song data from the widgets."""
+        if hasattr(list_item, "_playing_binding") and list_item._playing_binding:
+            list_item._playing_binding.unbind()
+            list_item._playing_binding = None
 
     def _on_row_drag_prepare(self, source, x, y, list_item):
         """Prepares the drag operation for a playlist row."""
@@ -2040,7 +2080,10 @@ class MamoWindow(Adw.ApplicationWindow):
             # Auto-play if requested via internal flag OR menu setting
             auto_play_enabled = self.action_group.get_action_state("auto_play").get_boolean()
             if self._auto_play_after_load or auto_play_enabled:
+                print(f"DISCOVERED: Queueing autoplay for '{song_to_add.title}' (Flag={self._auto_play_after_load}, Menu={auto_play_enabled})")
                 GLib.idle_add(self._check_and_autoplay, song_to_add)
+            else:
+                print(f"DISCOVERED: Autoplay skipped for '{song_to_add.title}'")
 
         elif result == GstPbutils.DiscovererResult.TIMEOUT:
              print(f"Discovery Timeout: {uri}", file=sys.stderr)
@@ -2053,12 +2096,22 @@ class MamoWindow(Adw.ApplicationWindow):
 
     def _check_and_autoplay(self, specific_song=None):
         """Checks if we should auto-play a song after load."""
-        # Only autoplay if requested AND nothing is currently playing (to avoid interruption)
-        # unless it's an explicit "Play Album" which we might want to allow to interrupt.
-        # For now, let's keep it safe: only if not already playing.
+        song_title = specific_song.title if specific_song else "None"
+        print(f"AUTOPLAY START: song='{song_title}' current_song='{self.current_song.title if self.current_song else 'None'}'")
+        # Safeguard: if we already have a song setting up or playing, don't interrupt.
+        # This prevents the "leap-frogging" bug where multiple discovered songs
+        # all try to start playback in rapid succession.
+        if self.current_song is not None:
+             print(f"_check_and_autoplay: current_song is already set ('{self.current_song.title}'), skipping.")
+             self._auto_play_after_load = False
+             return
+
+        print(f"_check_and_autoplay: requested for specific_song='{specific_song.title if specific_song else 'None'}'")
         auto_play_enabled = self.action_group.get_action_state("auto_play").get_boolean()
         if self._auto_play_after_load or auto_play_enabled:
+            # Also check player state as a backup
             if self.player and self.player.get_state(0).state == Gst.State.PLAYING:
+                print("_check_and_autoplay: player is already PLAYING, skipping.")
                 self._auto_play_after_load = False # Clear internal flag
                 return
 
@@ -2209,9 +2262,6 @@ class MamoWindow(Adw.ApplicationWindow):
 
         # Update is_playing state in playlist - O(N) but better than old loop if we only touch changed items
         # Fast path: only reset previous and set new
-        if not hasattr(self, "_last_indicated_song"):
-             self._last_indicated_song = None
-             
         if self._last_indicated_song:
              self._last_indicated_song.is_playing = False
         
@@ -2857,16 +2907,15 @@ class MamoWindow(Adw.ApplicationWindow):
             self.playlist_store.append(s)
         self._is_loading = False
         self._update_viewport()
+        self._update_viewport()
+        
+        # We NO LONGER populate the Now Playing UI here by default,
+        # to ensure it stays in sync with current_song (which is None).
         self._update_song_display(None)
+        self.selection_model.set_selected(0)
 
         # Trigger background repair for 0-duration items
         threading.Thread(target=self._repair_playlist_durations, daemon=True).start()
-
-        # Populate "Now Playing" with the first song if available
-        if self.playlist_store.get_n_items() > 0:
-            first_song = self.playlist_store.get_item(0)
-            self._update_song_display(first_song)
-            self.selection_model.set_selected(0)
 
     def _repair_playlist_durations(self):
         """Background thread to fix missing durations in the playlist."""
