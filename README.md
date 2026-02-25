@@ -52,6 +52,6 @@ Navigate to the project's root directory in your terminal and run:
 
 ```bash
 python3 mamo.py
-
+```
 
 Mamo is originally based on [Namo](https://github.com/hardcoeur/Namo)
