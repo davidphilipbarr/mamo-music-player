@@ -1,0 +1,122 @@
+# SOME DESCRIPTIVE TITLE.
+# Copyright (C) YEAR THE PACKAGE'S COPYRIGHT HOLDER
+# This file is distributed under the same license as the PACKAGE package.
+# FIRST AUTHOR <EMAIL@ADDRESS>, YEAR.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: PACKAGE VERSION\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-02-06 06:45+0000\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"Language: \n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=CHARSET\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+#: mamo/ui/window.py:179 mamo/ui/window.py:1579
+msgid "Open Playlist"
+msgstr ""
+
+#: mamo/ui/window.py:180
+msgid "Save Playlist"
+msgstr ""
+
+#: mamo/ui/window.py:181
+msgid "Add Folder..."
+msgstr ""
+
+#: mamo/ui/window.py:182
+msgid "Add Files..."
+msgstr ""
+
+#: mamo/ui/window.py:183
+msgid "Clear Playlist"
+msgstr ""
+
+#: mamo/ui/window.py:186
+msgid "Use Dark Mode"
+msgstr ""
+
+#: mamo/ui/window.py:187
+msgid "Use Album Tinting"
+msgstr ""
+
+#: mamo/ui/window.py:188
+msgid "Auto Play"
+msgstr ""
+
+#: mamo/ui/window.py:189
+msgid "Loop All"
+msgstr ""
+
+#: mamo/ui/window.py:190
+msgid "Clear Playlist on Start"
+msgstr ""
+
+#: mamo/ui/window.py:191
+msgid "About"
+msgstr ""
+
+#: mamo/ui/window.py:200 mamo/ui/browser.py:10
+msgid "Album Browser"
+msgstr ""
+
+#: mamo/ui/window.py:786
+msgid "Remove from Playlist"
+msgstr ""
+
+#: mamo/ui/window.py:789
+msgid "Repeat this song"
+msgstr ""
+
+#: mamo/ui/window.py:793
+msgid "Show in File Manager"
+msgstr ""
+
+#: mamo/ui/window.py:944
+msgid "Select Audio File(s)"
+msgstr ""
+
+#: mamo/ui/window.py:1616
+msgid "Save Playlist As"
+msgstr ""
+
+#: mamo/ui/window.py:1672
+msgid "Select Folder(s) to Add"
+msgstr ""
+
+#: mamo/ui/browser.py:48
+msgid "Search Artist or Album..."
+msgstr ""
+
+#: mamo/ui/browser.py:55 mamo/ui/browser.py:214
+msgid "Library: "
+msgstr ""
+
+#: mamo/ui/browser.py:60
+msgid "Change..."
+msgstr ""
+
+#: mamo/ui/browser.py:64
+msgid "Rescan"
+msgstr ""
+
+#: mamo/ui/browser.py:91
+msgid "Cancel"
+msgstr ""
+
+#: mamo/ui/browser.py:95
+msgid "Queue Album"
+msgstr ""
+
+#: mamo/ui/browser.py:100
+msgid "Add Album"
+msgstr ""
+
+#: mamo/ui/browser.py:205
+msgid "Select Music Library Folder"
+msgstr ""
